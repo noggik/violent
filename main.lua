@@ -1,6 +1,9 @@
 local Fluent = loadstring(game:HttpGet("https://raw.githubusercontent.com/discoart/FluentPlus/refs/heads/main/Beta.lua"))()
 
 getgenv().killerEspEnabled = false
+getgenv().autoParryEnabled = false
+getgenv().autoParryDelay = 0.1
+getgenv().autoParryRange = 8
 
 if getgenv().killerEspConnection then
     getgenv().killerEspConnection:Disconnect()
@@ -12,6 +15,7 @@ local clonerefFunction = cloneref or function(instance) return instance end
 local playersService = clonerefFunction(game:GetService("Players"))
 local runService = clonerefFunction(game:GetService("RunService"))
 local collectionService = clonerefFunction(game:GetService("CollectionService"))
+local replicatedStorage = clonerefFunction(game:GetService("ReplicatedStorage"))
 
 local localPlayer = clonerefFunction(playersService.LocalPlayer)
 local currentCamera = workspace.CurrentCamera
@@ -23,7 +27,7 @@ local Window = Fluent:CreateWindow({
     Icon = "skull",
     TabWidth = 160,
     Size = UDim2.fromOffset(580, 460),
-    Acrylic = false,
+    Acrylic = true,
     Theme = "Dark",
     MinimizeKey = Enum.KeyCode.LeftControl
 })
@@ -36,10 +40,23 @@ local Options = Fluent.Options
 
 if not Drawing or not Drawing.new then
     warn("Executor does not support Drawing library")
-    return
 end
 
 local espDrawings = {}
+local firedParryTracks = {}
+local lastParryFireTime = 0
+local parryFireDebounce = 1
+local autoParryEvent = nil
+
+task.spawn(function()
+    local remotesFolder = replicatedStorage:WaitForChild("Remotes", 10)
+    if not remotesFolder then return end
+    local itemsFolder = remotesFolder:WaitForChild("Items", 10)
+    if not itemsFolder then return end
+    local daggerFolder = itemsFolder:WaitForChild("Parrying Dagger", 10)
+    if not daggerFolder then return end
+    autoParryEvent = daggerFolder:WaitForChild("parry", 10)
+end)
 
 local function safeRemove(drawingObject)
     if drawingObject then
@@ -176,14 +193,109 @@ local function updateSkeletonLines(drawingSet, skeletonJoints)
     end
 end
 
-local function updateKillerEsp()
-    if not getgenv().killerEspEnabled then
-        for _, drawingSet in pairs(espDrawings) do
-            hideDrawingSet(drawingSet)
-        end
+local function isSelfBusy()
+    local playerCharacter = localPlayer.Character
+    if not playerCharacter then
+        return true
+    end
+
+    if playerCharacter:GetAttribute("IsDead") or playerCharacter:GetAttribute("IsCarried") or playerCharacter:GetAttribute("IsHooked") then
+        return true
+    end
+
+    local myRootPart = playerCharacter:FindFirstChild("HumanoidRootPart")
+    if not myRootPart then
+        return true
+    end
+
+    if collectionService:HasTag(myRootPart, "doing action") then
+        return true
+    end
+
+    return false
+end
+
+local function tryAutoParry(killerModel, killerRootPart)
+    if not getgenv().autoParryEnabled then
         return
     end
 
+    if not autoParryEvent then
+        return
+    end
+
+    local playerCharacter = localPlayer.Character
+    if not playerCharacter then
+        return
+    end
+
+    if killerModel == playerCharacter then
+        return
+    end
+
+    if not playerCharacter:FindFirstChild("Parrying Dagger") then
+        return
+    end
+
+    if isSelfBusy() then
+        return
+    end
+
+    local myRootPart = playerCharacter:FindFirstChild("HumanoidRootPart")
+    if not myRootPart then
+        return
+    end
+
+    local distanceToKiller = (killerRootPart.Position - myRootPart.Position).Magnitude
+    if distanceToKiller > getgenv().autoParryRange then
+        return
+    end
+
+    local killerHumanoid = killerModel:FindFirstChildOfClass("Humanoid")
+    if not killerHumanoid then
+        return
+    end
+
+    local killerAnimator = killerHumanoid:FindFirstChildOfClass("Animator")
+    if not killerAnimator then
+        return
+    end
+
+    local success, playingTracks = pcall(killerAnimator.GetPlayingAnimationTracks, killerAnimator)
+    if not success or not playingTracks then
+        return
+    end
+
+    for _, animTrack in ipairs(playingTracks) do
+        local trackPriorityValue = animTrack.Priority.Value
+        if trackPriorityValue >= Enum.AnimationPriority.Action.Value and not firedParryTracks[animTrack] then
+            firedParryTracks[animTrack] = true
+
+            local now = os.clock()
+            if now - lastParryFireTime >= parryFireDebounce then
+                lastParryFireTime = now
+                task.delay(getgenv().autoParryDelay, function()
+                    pcall(function()
+                        autoParryEvent:FireServer()
+                    end)
+                end)
+            end
+        end
+    end
+end
+
+local function pruneParryTracks()
+    for animTrack in pairs(firedParryTracks) do
+        local success, isPlaying = pcall(function()
+            return animTrack.IsPlaying
+        end)
+        if not success or not isPlaying then
+            firedParryTracks[animTrack] = nil
+        end
+    end
+end
+
+local function updateKillerEsp()
     if not currentCamera or not currentCamera.Parent then
         currentCamera = workspace.CurrentCamera
     end
@@ -203,6 +315,12 @@ local function updateKillerEsp()
 
             if killerRootPart and killerHumanoid and killerHumanoid.Health > 0 then
                 activeKillers[killerModel] = true
+
+                tryAutoParry(killerModel, killerRootPart)
+
+                if not getgenv().killerEspEnabled then
+                    continue
+                end
 
                 local drawingSet = getDrawingSet(killerModel)
                 local rootScreenPosition, onScreen = currentCamera:WorldToViewportPoint(killerRootPart.Position)
@@ -285,6 +403,18 @@ local function updateKillerEsp()
     end
 end
 
+local function onRenderStep()
+    pruneParryTracks()
+
+    if getgenv().killerEspEnabled and Drawing and Drawing.new then
+        updateKillerEsp()
+    else
+        for _, drawingSet in pairs(espDrawings) do
+            hideDrawingSet(drawingSet)
+        end
+    end
+end
+
 local espToggle = Tabs.Main:AddToggle("EspToggle", {
     Title = "ESP",
     Default = false
@@ -297,12 +427,45 @@ espToggle:OnChanged(function(toggleValue)
     end
 end)
 
+local autoParryToggle = Tabs.Main:AddToggle("AutoParryToggle", {
+    Title = "Auto Parry",
+    Default = false
+})
+
+autoParryToggle:OnChanged(function(toggleValue)
+    getgenv().autoParryEnabled = toggleValue
+end)
+
+local parryDelaySlider = Tabs.Main:AddSlider("ParryDelaySlider", {
+    Title = "Parry Delay",
+    Description = "วินาทีที่หน่วงหลังจับสัญญาณฟัน",
+    Default = 0.1,
+    Min = 0,
+    Max = 0.5,
+    Rounding = 2,
+    Callback = function(sliderValue)
+        getgenv().autoParryDelay = sliderValue
+    end
+})
+
+local parryRangeSlider = Tabs.Main:AddSlider("ParryRangeSlider", {
+    Title = "Parry Range",
+    Description = "ระยะห่างสูงสุด (studs) ที่จะพยายาม parry",
+    Default = 8,
+    Min = 3,
+    Max = 20,
+    Rounding = 1,
+    Callback = function(sliderValue)
+        getgenv().autoParryRange = sliderValue
+    end
+})
+
 Fluent:Notify({
     Title = "Violent",
-    Content = "Loaded. Killer ESP ready.",
+    Content = "Loaded. ESP + Auto Parry ready.",
     Duration = 5
 })
 
-getgenv().killerEspConnection = runService.RenderStepped:Connect(updateKillerEsp)
+getgenv().killerEspConnection = runService.RenderStepped:Connect(onRenderStep)
 
 Window:SelectTab(1)
